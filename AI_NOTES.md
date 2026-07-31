@@ -1,131 +1,49 @@
 # AI Notes
 
-## Tools Used
+## What I used
 
-- **Claude Sonnet 4.6 (Thinking)** — used for architecture discussion, scaffolding, boilerplate generation, and iterative implementation of all layers.
-- All AI-generated output was reviewed, corrected, and validated before being committed. Several components required deliberate intervention to meet production standards; those decisions are documented below.
+Claude (Sonnet) for the initial architecture discussion, boilerplate scaffolding, and first-pass implementations of each layer. Everything was reviewed and tested before committing. Below are the places where the AI output needed real intervention — not just cosmetic tweaks, but changes that would've caused bugs or design problems if I'd shipped the draft as-is.
 
----
+## Where AI got it right without changes
 
-## AI-Generated vs. Hand-Written
+The domain entity (`expense.py` — a plain dataclass), the exceptions module, the config, and the `InMemoryExpenseRepository` all came out clean on the first pass. Simple stuff. The `Protocol`-based repository interface was also correct — I just verified it only exposed the four methods we actually need (`add`, `get_all`, `get_by_id`, `delete`) and didn't bloat into a generic CRUD base.
 
-| Component | Origin | Notes |
-|-----------|--------|-------|
-| `src/domain/expense.py` | AI-drafted | No changes required — plain dataclass with no framework dependencies |
-| `src/core/exceptions.py` | AI-drafted | No changes required |
-| `src/core/config.py` | AI-drafted | No changes required |
-| `src/repositories/base.py` (Protocol) | AI-drafted | Reviewed and confirmed: 4 methods only (ISP enforcement) |
-| `src/repositories/json_file.py` | AI-drafted skeleton, **human-enforced** production details | Atomic write (`os.replace`) and `threading.Lock` were explicitly required — see §3 below |
-| `src/repositories/in_memory.py` | AI-drafted | `get_all()` returns `list(self._store)` (copy) — ensured by review to prevent caller mutation of internal state |
-| `src/schemas/expense.py` | AI-drafted, **human-corrected** on `amount` type | AI initially defaulted to `float`; changed to `Decimal` with `decimal_places=2` — see §1 below |
-| `src/services/expense_service.py` | AI-drafted | `delete_expense` reviewed to confirm it raises `ExpenseNotFoundError` and is not a silent no-op |
-| `src/api/routes/expenses.py` | AI-drafted, **human-corrected** on route order | `/summary` registration before `/{expense_id}` was a required manual fix — see §4 below |
-| `src/main.py` | AI-drafted | Reviewed exception handler shape for consistency |
-| `tests/unit/test_schemas.py` | AI-drafted | Added explicit `test_whitespace_only_rejected` — AI's first draft didn't cover blank-after-strip |
-| `tests/unit/test_expense_service.py` | AI-drafted | Added `test_summary_decimal_precision` (the `0.1+0.2=0.30` invariant) — AI's first pass omitted this critical edge case |
-| `tests/integration/test_expense_api.py` | AI-drafted | Added `test_summary_route_not_captured_as_id_param` to catch the route-order bug if it ever regresses |
+## Where I had to step in
 
----
+### The `float` → `Decimal` fix
 
-## What I Validated, Tested, or Changed, and Why
+The first draft of the Pydantic schema used `float` for the `amount` field. That's the kind of thing that works in a demo and breaks in production. Python's `float` is IEEE 754 binary, so `0.1 + 0.2` evaluates to `0.30000000000000004` — which means the `/summary` endpoint would return slightly wrong totals once you have enough expenses. Switched it to `Decimal` with `decimal_places=2` and `max_digits=12`.
 
-### 1. Data Integrity: `float` → `Decimal` for monetary amounts
+This wasn't just a schema change — it rippled through the whole persistence layer. The JSON repository serialises amounts as strings (`str(expense.amount)`) and reconstructs them with `Decimal(record["amount"])`, never going through `float()` at any point. I wrote a specific test (`test_summary_decimal_precision`) that sums `0.10 + 0.20` and asserts the result is exactly `0.30`, because that's the test that would've caught the original bug.
 
-AI's initial draft of `src/schemas/expense.py` defined the amount field as:
+### Atomic writes and the thread lock
 
-```python
-amount: float = Field(..., gt=0)
-```
+The AI's first version of `JsonFileExpenseRepository._write()` was a bare `path.write_text(json.dumps(data))`. Two problems with that:
 
-This was changed to:
+1. If the process gets killed mid-write, you end up with a half-written JSON file that `json.loads()` can't parse on the next startup. The fix: write to `expenses.tmp` first, then `os.replace(tmp, path)`. `os.replace` wraps `rename(2)` on POSIX, which is atomic — the old file is either fully there or fully replaced, never half-and-half.
 
-```python
-amount: Decimal = Field(..., gt=0, decimal_places=2, max_digits=12)
-```
+2. FastAPI runs sync route handlers in a thread pool. Without a lock, two concurrent POST requests can both read the file, both append their expense, and both write back — except the second write overwrites the first, silently losing data. A `threading.Lock()` around every read-modify-write cycle closes this.
 
-**Why it matters:** Python's `float` uses IEEE 754 binary representation. `0.1 + 0.2` evaluates to `0.30000000000000004`, not `0.3`. In the `get_summary()` method in `expense_service.py`, amounts are summed across all expenses. A user with several transactions would receive a subtly incorrect `total` in the summary response. This is a correctness failure in a financial application — not a style issue.
+Neither of these showed up in the AI's output. They came from thinking about "what breaks under real concurrency" and "what happens if the server crashes."
 
-Pydantic v2 supports `Decimal` natively with `decimal_places` and `max_digits` constraints (verified against v2 docs before using). The `_to_dict` / `_from_dict` serialization in `json_file.py` stores Decimal as `str(amount)` and reconstructs with `Decimal(record["amount"])` — not `float(record["amount"])` — to preserve exactness through the JSON round-trip.
+### Route ordering — the `/summary` bug
 
-This was validated explicitly with `test_summary_decimal_precision` in `test_expense_service.py`, which asserts that `Decimal("0.10") + Decimal("0.20") == Decimal("0.30")` through the full service stack.
+This was a subtle one. The AI registered `/{expense_id}` before `/summary` in the router. FastAPI matches routes in order, so a request to `GET /expenses/summary` would match `/{expense_id}` first, bind `expense_id = "summary"`, look it up, fail, and return a 404.
 
----
+The fix was straightforward — register `/summary` before `/{expense_id}` — but the real lesson is that this kind of bug is completely silent. It doesn't throw an error, it just routes to the wrong handler. I added a regression test (`test_summary_route_not_captured_as_id_param`) specifically so that if anyone reorders these routes later, the test suite catches it immediately instead of the bug sitting there until a user files a ticket.
 
-### 2. Concurrency & Safety: Atomic writes and thread lock in `JsonFileExpenseRepository`
+### Whitespace-only title edge case
 
-AI's initial repository implementation performed a straightforward `path.write_text(json.dumps(data))`. Two production-grade concerns were added:
+The AI's test suite didn't cover posting a title that's just spaces (`"   "`). The `min_length=1` constraint on the Pydantic field passes `"   "` because it has 3 characters — but after `.strip()` it's empty. I added an explicit check in the `@field_validator` to reject blank-after-strip titles, and a matching test.
 
-**a) Atomic write via `os.replace()`** (`json_file.py`, `_write` method):
+## What I said no to
 
-```python
-def _write(self, data: list[dict]) -> None:
-    tmp = self._path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    os.replace(tmp, self._path)
-```
+**SQLite / SQLAlchemy** — The AI suggested it. The assignment explicitly says no database is required, and the JSON file handles everything at this scale. Adding an ORM would've tripled the codebase for zero grading benefit.
 
-`os.replace()` wraps the POSIX `rename(2)` syscall, which is atomic. If the process is killed mid-write, the `.tmp` file is left orphaned — the real `expenses.json` is never left in a partially-written, corrupted state. A direct `write_text()` has no such guarantee.
+**Generic `Repository[T]`** — The AI wanted to build an abstract base that could handle any entity type. There's one entity. I used a `Protocol` with four specific methods instead.
 
-**b) `threading.Lock()` around every read-modify-write cycle:**
+**Pagination, sorting, PUT endpoint** — None of these are in the spec. Adding them would've meant more surface area to test and document, with no upside.
 
-FastAPI dispatches synchronous path functions to a thread pool executor (`asyncio.get_event_loop().run_in_executor`). With a single Uvicorn worker, two concurrent POST requests can both read the file before either writes back, causing one write to silently overwrite the other. A module-level `threading.Lock()` serialises all write operations within a process, closing this race.
+**Custom 422 handler** — FastAPI's default validation error response is already well-structured. Replacing it just to "own" the error format would've been busywork.
 
-Neither of these details appeared in AI's first draft. Both were explicitly added after reviewing what could go wrong in a concurrent server context.
-
----
-
-### 3. Scope Discipline: Rejecting SQLite, ORM, and over-engineered abstractions
-
-AI suggested two additions that were explicitly rejected:
-
-**a) SQLite via SQLAlchemy:**
-
-> "AI suggested replacing the JSON file with a SQLite database backed by SQLAlchemy for more robust querying."
-
-Rejected. The assignment's brief explicitly states "no database required." Adding SQLAlchemy would introduce ~300 lines of ORM models, sessions, migrations boilerplate, and a new dependency with no grading benefit. The JSON file, done with atomic writes and a lock, meets all functional requirements at this scale. Adding a database here reads as not knowing what "done" looks like.
-
-**b) Generic `Repository[T]` with a plugin registry:**
-
-> "AI proposed abstracting the repository interface as `Repository[Generic[T]]` with a registry pattern to support future entity types."
-
-Rejected. There is exactly one entity in this domain (`Expense`). A generic repository for hypothetical future entities is speculative abstraction that adds complexity without value. The `Protocol` approach used (`ExpenseRepository` with 4 specific methods) satisfies ISP and OCP for the actual problem size. The `JsonFileExpenseRepository` and `InMemoryExpenseRepository` are interchangeable for `Expense` exactly — nothing more is needed.
-
----
-
-### 4. Framework Expertise: Route registration order for `/summary` vs `/{id}`
-
-AI's initial draft of `src/api/routes/expenses.py` registered the routes in CRUD order:
-
-```python
-# AI's first draft (WRONG ORDER)
-@router.get("/{expense_id}", ...)   # registered first
-@router.get("/summary", ...)        # registered second — NEVER REACHED
-```
-
-FastAPI (via Starlette) matches routes in **registration order**. With the above order, a `GET /api/v1/expenses/summary` request matches `/{expense_id}` first, binding `expense_id = "summary"`, and routes to `get_expense("summary")` — which returns a `404 not found` instead of the summary.
-
-The fix was to register `/summary` explicitly before `/{expense_id}`:
-
-```python
-# Correct order (expenses.py, lines 52–62)
-# /summary MUST come before /{expense_id} — see module docstring.
-@router.get("/summary", ...)        # registered first — matches literal "summary"
-@router.get("/{expense_id}", ...)   # registered second — captures dynamic IDs
-```
-
-A regression test was added specifically for this (`test_summary_route_not_captured_as_id_param` in `test_expense_api.py`) so any future reordering immediately causes a test failure rather than a silent routing bug.
-
----
-
-## AI Suggestions I Rejected, and Why
-
-| Suggestion | Decision | Reason |
-|-----------|----------|--------|
-| `float` for `amount` | ❌ Rejected, changed to `Decimal` | Float arithmetic is incorrect for money; `0.1+0.2 ≠ 0.3` would corrupt summary totals |
-| SQLite + SQLAlchemy for persistence | ❌ Rejected | Assignment explicitly says no database; adds complexity with no functional benefit |
-| Generic `Repository[T]` abstraction | ❌ Rejected | Only one entity exists; speculative generics add ceremony without value |
-| Registering `/{id}` before `/summary` | ❌ Rejected (corrected) | Would cause FastAPI to route `/summary` as a dynamic ID lookup, returning 404 |
-| Pagination and sorting parameters | ❌ Rejected | Not in the assignment requirements; would bloat the API surface and test scope |
-| Docker and CI workflow | ❌ Rejected | Only one bonus (OpenAPI) was selected; building extras burns time without earning extra credit |
-| `PUT /expenses/{id}` update endpoint | ❌ Rejected | Not in the specified API contract (§5 of the plan); adding it is scope creep |
-| `@app.exception_handler` for `422` | ❌ Rejected | FastAPI's default 422 shape is already correct; reinventing it wastes effort with no benefit |
+**Docker / CI** — I picked the OpenAPI bonus. Building Docker on top of that doesn't earn extra marks and eats into time better spent on code quality.
